@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using RimTalk.Service;
+using RimWorld;
 using Verse;
 using Random = System.Random;
 
@@ -18,10 +19,22 @@ public static class Cache
     private static readonly Random Random = new();
 
     public static IEnumerable<Pawn> Keys => PawnCache.Keys;
+    public static Pawn GetPlayer() => _playerPawn;
+
+    // Invisible player pawn
+    private static Pawn _playerPawn;
 
     public static PawnState Get(Pawn pawn)
     {
-        return pawn == null ? null : PawnCache.TryGetValue(pawn, out var state) ? state : null;
+        if (pawn == null) return null;
+
+        if (PawnCache.TryGetValue(pawn, out var state)) return state;
+
+        if (!pawn.IsTalkEligible()) return null;
+        
+        PawnCache[pawn] = new PawnState(pawn);
+        NameCache[pawn.LabelShort] = pawn;
+        return PawnCache[pawn];
     }
 
     /// <summary>
@@ -36,14 +49,11 @@ public static class Cache
     public static void Refresh()
     {
         // Identify and remove ineligible pawns from all caches.
-        foreach (Pawn pawn in PawnCache.Keys.ToList())
+        foreach (var pawn in PawnCache.Keys.ToList().Where(pawn => !pawn.IsTalkEligible()))
         {
-            if (!pawn.IsTalkEligible())
+            if (PawnCache.TryRemove(pawn, out var removedState))
             {
-                if (PawnCache.TryRemove(pawn, out var removedState))
-                {
-                    NameCache.TryRemove(removedState.Pawn.LabelShort, out _);
-                }
+                NameCache.TryRemove(removedState.Pawn.LabelShort, out _);
             }
         }
 
@@ -56,6 +66,9 @@ public static class Cache
                 NameCache[pawn.LabelShort] = pawn;
             }
         }
+
+        if (_playerPawn == null)
+            InitializePlayerPawn();
     }
 
     public static IEnumerable<PawnState> GetAll()
@@ -67,6 +80,7 @@ public static class Cache
     {
         PawnCache.Clear();
         NameCache.Clear();
+        _playerPawn = null;
     }
 
     private static double GetScaleFactor(double groupWeight, double baselineWeight)
@@ -99,7 +113,7 @@ public static class Cache
         foreach (var p in pawnList)
         {
             var weight = Get(p)?.TalkInitiationWeight ?? 0.0;
-            if (p.IsFreeNonSlaveColonist) totalColonistWeight += weight;
+            if (p.IsFreeNonSlaveColonist || p.HasVocalLink()) totalColonistWeight += weight;
             else if (p.IsSlave) totalSlaveWeight += weight;
             else if (p.IsPrisoner) totalPrisonerWeight += weight;
             else if (p.IsVisitor()) totalVisitorWeight += weight;
@@ -140,7 +154,7 @@ public static class Cache
         var effectiveTotalWeight = pawnList.Sum(p =>
         {
             var weight = Get(p)?.TalkInitiationWeight ?? 0.0;
-            if (p.IsFreeNonSlaveColonist) return weight * colonistScaleFactor;
+            if (p.IsFreeNonSlaveColonist || p.HasVocalLink()) return weight * colonistScaleFactor;
             if (p.IsSlave) return weight * slaveScaleFactor;
             if (p.IsPrisoner) return weight * prisonerScaleFactor;
             if (p.IsVisitor()) return weight * visitorScaleFactor;
@@ -155,7 +169,7 @@ public static class Cache
         {
             var currentPawnWeight = Get(pawn)?.TalkInitiationWeight ?? 0.0;
 
-            if (pawn.IsFreeNonSlaveColonist) cumulativeWeight += currentPawnWeight * colonistScaleFactor;
+            if (pawn.IsFreeNonSlaveColonist || pawn.HasVocalLink()) cumulativeWeight += currentPawnWeight * colonistScaleFactor;
             else if (pawn.IsSlave) cumulativeWeight += currentPawnWeight * slaveScaleFactor;
             else if (pawn.IsPrisoner) cumulativeWeight += currentPawnWeight * prisonerScaleFactor;
             else if (pawn.IsVisitor()) cumulativeWeight += currentPawnWeight * visitorScaleFactor;
@@ -168,5 +182,13 @@ public static class Cache
         }
 
         return pawnList.LastOrDefault(p => (Get(p)?.TalkInitiationWeight ?? 0.0) > 0);
+    }
+
+    private static void InitializePlayerPawn()
+    {
+        _playerPawn = PawnGenerator.GeneratePawn(PawnKindDefOf.Colonist);
+        _playerPawn.Name = new NameSingle("RimTalk.CustomDialogue.Player".Translate());
+        PawnCache[_playerPawn] = new PawnState(_playerPawn);
+        NameCache[_playerPawn.LabelShort] = _playerPawn;
     }
 }

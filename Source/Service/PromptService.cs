@@ -3,7 +3,6 @@ using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using HarmonyLib;
-using RimLife;
 using RimTalk.Data;
 using RimTalk.Source.Data;
 using RimTalk.Util;
@@ -30,9 +29,18 @@ public static class PromptService
         int count = 0;
         foreach (Pawn pawn in pawns)
         {
-            // Main pawn gets more detail, others get basic info
-            InfoLevel infoLevel = pawn == pawns[0] ? InfoLevel.Normal : InfoLevel.Short;
-            string pawnContext = CreatePawnProContext(pawn, infoLevel);
+            string pawnContext;
+            if (pawn.IsPlayer())
+            {
+                pawnContext =  $"{pawn.LabelShort}\nRole: {pawn.GetRole()}";   
+            }
+            else
+            {
+                // Main pawn gets more detail, others get basic info
+                InfoLevel infoLevel = pawn == pawns[0] ? InfoLevel.Normal : InfoLevel.Short;
+                pawnContext = CreatePawnContext(pawn, infoLevel);
+            }
+
             Cache.Get(pawn).Context = pawnContext;
             count++;
             context.AppendLine();
@@ -49,18 +57,19 @@ public static class PromptService
         StringBuilder sb = new StringBuilder();
 
         var name = pawn.LabelShort;
-        var title = pawn.story.title == null ? "" : $"({pawn.story.title})";
+        var title = pawn.story?.title == null ? "" : $"({pawn.story.title})";
         var genderAndAge = Regex.Replace(pawn.MainDesc(false), @"\(\d+\)", "");
         sb.AppendLine($"{name} {title} ({genderAndAge})");
 
-        var role = $"Role: {pawn.GetRole(true)}";
-        sb.AppendLine(role);
+        var role = pawn.GetRole(true);
+        if (role != null)
+            sb.AppendLine($"Role: {role}");
 
         if (ModsConfig.BiotechActive && pawn.genes?.Xenotype != null)
         {
             var xenotypeInfo = $"Race: {pawn.genes.Xenotype.LabelCap}";
             // if (!pawn.genes.Xenotype.descriptionShort.NullOrEmpty())
-                // xenotypeInfo += $" - {pawn.genes.Xenotype.descriptionShort}";
+            // xenotypeInfo += $" - {pawn.genes.Xenotype.descriptionShort}";
             sb.AppendLine(xenotypeInfo);
         }
 
@@ -103,7 +112,7 @@ public static class PromptService
         if (pawn.IsEnemy() || pawn.IsVisitor())
             return sb.ToString();
 
-        if (pawn.story.Childhood != null)
+        if (pawn.story?.Childhood != null)
         {
             var childHood =
                 $"Childhood: {pawn.story.Childhood.title}({pawn.story.Childhood.titleShort})";
@@ -111,7 +120,7 @@ public static class PromptService
             sb.AppendLine(childHood);
         }
 
-        if (pawn.story.Adulthood != null)
+        if (pawn.story?.Adulthood != null)
         {
             var adulthood =
                 $"Adulthood: {pawn.story.Adulthood.title}({pawn.story.Adulthood.titleShort})";
@@ -119,27 +128,25 @@ public static class PromptService
             sb.AppendLine(adulthood);
         }
 
-        var traits = "Traits: ";
-        foreach (Trait trait in pawn.story.traits.TraitsSorted)
+        var traits = "";
+        foreach (Trait trait in pawn.story?.traits?.TraitsSorted ?? Enumerable.Empty<Trait>())
         {
-            foreach (TraitDegreeData degreeData in trait.def.degreeDatas)
+            foreach (var degreeData in trait.def.degreeDatas.Where(degreeData => degreeData.degree == trait.Degree))
             {
-                if (degreeData.degree == trait.Degree)
-                {
-                    traits += degreeData.label + (infoLevel == InfoLevel.Full
-                        ? $":{Sanitize(degreeData.description, pawn)}\n"
-                        : ",");
-                    break;
-                }
+                traits += degreeData.label + (infoLevel == InfoLevel.Full
+                    ? $":{Sanitize(degreeData.description, pawn)}\n"
+                    : ",");
+                break;
             }
         }
 
-        sb.AppendLine(traits);
+        if (traits != "")
+            sb.AppendLine($"Traits: {traits}");
 
         if (infoLevel != InfoLevel.Short)
         {
             var skills = "Skills: ";
-            foreach (SkillRecord skillRecord in pawn.skills.skills)
+            foreach (SkillRecord skillRecord in pawn.skills?.skills ?? Enumerable.Empty<SkillRecord>())
             {
                 skills += $"{skillRecord.def.label}: {skillRecord.Level}, ";
             }
@@ -150,28 +157,15 @@ public static class PromptService
         return sb.ToString();
     }
 
-    public static string CreatePawnProContext(Pawn pawn, InfoLevel infoLevel = InfoLevel.Normal)
-    {
-        var p_pro = new PawnPro(pawn);
-        return infoLevel switch
-        {
-            InfoLevel.Short => p_pro.ToStringLite(),
-            InfoLevel.Normal => p_pro.ToStringLite(),
-            InfoLevel.Full => p_pro.ToStringFull(),
-            _ => p_pro.ToStringCore(),
-        };
-    }
-
     public static string CreatePawnContext(Pawn pawn, InfoLevel infoLevel = InfoLevel.Normal)
     {
         StringBuilder sb = new StringBuilder();
-
-        if (pawn.RaceProps.Humanlike)
-            sb.Append(CreatePawnBackstory(pawn, infoLevel));
+        
+        sb.Append(CreatePawnBackstory(pawn, infoLevel));
 
         // add Health
         var method = AccessTools.Method(typeof(HealthCardUtility), "VisibleHediffs");
-        IEnumerable<Hediff> hediffs = (IEnumerable<Hediff>)method.Invoke(null, new object[] { pawn, false });
+        IEnumerable<Hediff> hediffs = (IEnumerable<Hediff>)method.Invoke(null, [pawn, false]);
 
         var hediffDict = hediffs
             .GroupBy(hediff => hediff.def)
@@ -194,20 +188,24 @@ public static class PromptService
             return sb.ToString();
 
         var m = pawn.needs?.mood;
-        var mood = pawn.Downed
-            ? "Critical: Downed (in pain/distress)"
-            : pawn.InMentalState
-                ? $"Mood: {pawn.MentalState?.InspectLine} (in mental break)"
-                : $"Mood: {m?.MoodString ?? "N/A"} ({(int)((m?.CurLevelPercentage ?? 0) * 100)}%)";
-        sb.AppendLine(mood);
+        if (m?.MoodString != null)
+        {
+            var mood = pawn.Downed && !pawn.IsBaby()
+                ? "Critical: Downed (in pain/distress)"
+                : pawn.InMentalState
+                    ? $"Mood: {pawn.MentalState?.InspectLine} (in mental break)"
+                    : $"Mood: {m.MoodString} ({(int)(m.CurLevelPercentage * 100)}%)";
+            sb.AppendLine(mood);
+        }
 
-        var thoughts = "Memory: ";
+        var thoughts = "";
         foreach (Thought thought in GetThoughts(pawn).Keys)
         {
             thoughts += $"{Sanitize(thought.LabelCap)}, ";
         }
 
-        sb.AppendLine(thoughts);
+        if (thoughts != "")
+            sb.AppendLine($"Memory: {thoughts}");
 
         if (pawn.IsSlave || pawn.IsPrisoner)
             sb.AppendLine(pawn.GetPrisonerSlaveStatus());
@@ -228,104 +226,91 @@ public static class PromptService
 
         if (infoLevel != InfoLevel.Short)
         {
-            var equipment = "Equipment: ";
+            var equipments = "";
             if (pawn.equipment?.Primary != null)
-                equipment += $"Weapon: {pawn.equipment.Primary.LabelCap}, ";
+                equipments += $"Weapon: {pawn.equipment.Primary.LabelCap}, ";
 
             var wornApparel = pawn.apparel?.WornApparel;
             var apparelLabels =
-                wornApparel != null ? wornApparel.Select(a => a.LabelCap) : Enumerable.Empty<string>();
+                wornApparel != null ? wornApparel.Select(a => a.LabelCap) : [];
 
             if (apparelLabels.Any())
             {
-                equipment += $"Apparel: {string.Join(", ", apparelLabels)}";
+                equipments += $"Apparel: {string.Join(", ", apparelLabels)}";
             }
 
-            if (equipment != "Equipment: ")
-                sb.AppendLine(equipment);
+            if (equipments != "")
+                sb.AppendLine($"Equipments: {equipments}");
         }
 
         return sb.ToString();
     }
 
-    // 功能：在对话请求的提示中添加上下文信息，如角色状态、位置、时间等。
-
     public static void DecoratePrompt(TalkRequest talkRequest, List<Pawn> pawns, string status)
     {
         var sb = new StringBuilder();
         CommonUtil.InGameData gameData = CommonUtil.GetInGameData();
-        
+
         string shortName = $"{pawns[0].LabelShort}({pawns[0].GetRole()})";
 
         // Add the conversation part
-        // 行为：
-        // 如果是用户发起的对话，格式化为用户与角色之间的对话开头。
         if (talkRequest.TalkType == TalkType.User)
         {
-            if (talkRequest.Initiator == talkRequest.Recipient)
-                sb.Append(
-                    $"A voice from beyond says '{pawns[0].LabelShort}({pawns[0].GetRole()}):{talkRequest.Prompt}'");
-            else
-                sb.Append(
-                    $"{pawns[1].LabelShort}({pawns[1].GetRole()}) said to '{pawns[0].LabelShort}({pawns[0].GetRole()}):{talkRequest.Prompt}'. Generate multi turn dialogues, starting with {pawns[0].LabelShort}, ");
+            sb.Append($"{pawns[1].LabelShort}({pawns[1].GetRole()}) said to '{pawns[0].LabelShort}({pawns[0].GetRole()}): {talkRequest.Prompt}'.");
+            sb.Append($"Generate multi turn dialogues starting after this (do not repeat initial dialogue), beginning with {pawns[0].LabelShort}");
         }
-        // 否则，根据对话的类型和角色的状态，生成不同风格的对话开头。
         else
         {
-            // 如果只有一个角色参与，则生成简短的独白。
-            if (pawns.Count == 1) 
+            if (pawns.Count == 1)
                 sb.Append($"{shortName} short monologue");
-            else if (pawns[0].IsInCombat() || pawns[0].GetMapRole() == MapRole.Invading) // 战斗中或侵略者
+            else if (pawns[0].IsInCombat() || pawns[0].GetMapRole() == MapRole.Invading)
             {
-                if (talkRequest.TalkType != TalkType.Urgent && !pawns[0].InMentalState) // 非紧急且非精神状态
+                if (talkRequest.TalkType != TalkType.Urgent && !pawns[0].InMentalState)
                 {
                     talkRequest.Prompt = null;
                 }
+
                 talkRequest.TalkType = TalkType.Urgent;
-                // 奴隶或囚犯仅表达担忧
                 if (pawns[0].IsSlave || pawns[0].IsPrisoner)
                     sb.Append($"{shortName} dialogue short (worry)");
-                // 其他情况表达紧急指挥
                 else
-                    sb.Append($"{shortName} dialogue short, urgent tone ({pawns[0].GetMapRole().ToString().ToLower()}/command)");
+                    sb.Append(
+                        $"{shortName} dialogue short, urgent tone ({pawns[0].GetMapRole().ToString().ToLower()}/command)");
             }
-            // 多个角色参与，生成对话开头。
             else
             {
                 sb.Append($"{shortName} starts conversation, taking turns");
             }
 
-            // 根据角色的具体状态，调整对话的风格和内容。
-            if (pawns[0].InMentalState) // 精神状态
+            if (pawns[0].InMentalState)
                 sb.Append($"\nbe dramatic (mental break)");
-            else if (pawns[0].Downed) // 受伤倒地
+            else if (pawns[0].Downed && !pawns[0].IsBaby())
                 sb.Append($"\n(downed in pain. Short, strained dialogue)");
-            else // 正常
+            else
                 sb.Append($"\n{talkRequest.Prompt}");
         }
 
 
         // add pawn status
-        // 行为：在提示中添加角色的当前状态信息。
         sb.Append($"\n{status}");
 
         string locationStatus = GetPawnLocationStatus(pawns[0]);
         if (!string.IsNullOrEmpty(locationStatus))
             sb.Append($"\nLocation: {locationStatus}");
 
-        // add time 时间
+        // add time
         sb.Append($"\nTime: {gameData.Hour12HString}");
 
-        // add date 日期
+        // add date
         sb.Append($"\nToday: {gameData.DateString}");
 
-        // add season 季节
+        // add season
         sb.Append($"\nSeason: {gameData.SeasonString}");
 
-        // add weather 天气
+        // add weather
         sb.Append($"\nWeather: {gameData.WeatherString}");
 
-        // add language assurance 语言确认
+        // add language assurance
         if (AIService.IsFirstInstruction())
             sb.Append($"\nin {Constant.Lang}");
 
@@ -342,7 +327,7 @@ public static class PromptService
             return "Indoors".Translate();
         return "Outdoors".Translate();
     }
-    
+
     public static Dictionary<Thought, float> GetThoughts(Pawn pawn)
     {
         var thoughts = new List<Thought>();

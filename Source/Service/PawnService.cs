@@ -12,29 +12,22 @@ public static class PawnService
 {
     public static bool IsTalkEligible(this Pawn pawn)
     {
-        if (pawn.DestroyedOrNull() || !pawn.Spawned || pawn.Dead)
-            return false;
-
-        if (!pawn.RaceProps.Humanlike)
-            return false;
-
-        if (pawn.RaceProps.intelligence < Intelligence.Humanlike)
-            return false;
-
-        if (!pawn.health.capacities.CapableOf(PawnCapacityDefOf.Talking))
-            return false;
-
-        if (pawn.skills?.GetSkill(SkillDefOf.Social) == null)
-            return false;
+        if (pawn.IsPlayer()) return true;
+        if (pawn.HasVocalLink()) return true;
+        if (pawn.DestroyedOrNull() || !pawn.Spawned || pawn.Dead) return false;
+        if (!pawn.RaceProps.Humanlike) return false;
+        if (pawn.RaceProps.intelligence < Intelligence.Humanlike) return false;
+        if (!pawn.health.capacities.CapableOf(PawnCapacityDefOf.Talking)) return false;
+        if (pawn.skills?.GetSkill(SkillDefOf.Social) == null) return false;
 
         RimTalkSettings settings = Settings.Get();
         return pawn.IsFreeColonist ||
                (settings.AllowSlavesToTalk && pawn.IsSlave) ||
                (settings.AllowPrisonersToTalk && pawn.IsPrisoner) ||
                (settings.AllowOtherFactionsToTalk && pawn.IsVisitor()) ||
-               (settings.AllowEnemiesToTalk && pawn.IsEnemy());
+               (settings.AllowEnemiesToTalk && pawn.IsEnemy()) ||
+               (settings.AllowBabiesToTalk && pawn.IsBaby());
     }
-
     public static HashSet<Hediff> GetHediffs(this Pawn pawn)
     {
         return pawn?.health.hediffSet.hediffs.Where(hediff => hediff.Visible).ToHashSet();
@@ -42,7 +35,7 @@ public static class PawnService
 
     public static bool IsInDanger(this Pawn pawn, bool includeMentalState = false)
     {
-        if (pawn == null) return false;
+        if (pawn == null || pawn.IsPlayer()) return false;
         if (pawn.Dead) return true;
         if (pawn.Downed) return true;
         if (!pawn.health.capacities.CapableOf(PawnCapacityDefOf.Moving)) return true;
@@ -83,6 +76,7 @@ public static class PawnService
     public static string GetRole(this Pawn pawn, bool includeFaction = false)
     {
         if (pawn == null) return null;
+        if (pawn.IsPlayer()) return "Voice from beyond";
         if (pawn.IsPrisoner) return "Prisoner";
         if (pawn.IsSlave) return "Slave";
         if (pawn.IsEnemy())
@@ -94,7 +88,7 @@ public static class PawnService
             return includeFaction && pawn.Faction != null ? $"Visitor Group({pawn.Faction.Name})" : "Visitor";
         if (pawn.IsQuestLodger()) return "Lodger";
         if (pawn.IsFreeColonist) return pawn.GetMapRole() == MapRole.Invading ? "Invader" : "Colonist";
-        return "Unknown";
+        return null;
     }
 
     public static bool IsVisitor(this Pawn pawn)
@@ -105,6 +99,11 @@ public static class PawnService
     public static bool IsEnemy(this Pawn pawn)
     {
         return pawn != null && pawn.HostileTo(Faction.OfPlayer);
+    }
+
+    public static bool IsBaby(this Pawn pawn)
+    {
+        return pawn.ageTracker?.CurLifeStage?.developmentalStage < DevelopmentalStage.Child;
     }
 
     public static (string, bool) GetPawnStatusFull(this Pawn pawn, List<Pawn> nearbyPawns)
@@ -228,9 +227,17 @@ public static class PawnService
         float closestDistSq = float.MaxValue;
 
         if (hostileTargets == null) return null;
+
         foreach (var target in hostileTargets.Where(target => GenHostility.IsActiveThreatTo(target, pawn.Faction)))
         {
             if (target.Thing is not Pawn threatPawn) continue;
+            if (threatPawn.Downed) continue;
+            if (pawn.IsPrisoner)
+            {
+                // Prevent prisoners from recognizing host faction or other prisoner from hostile faction as a threat
+                if (threatPawn.Faction == pawn.HostFaction || threatPawn.IsPrisoner) continue;
+            }
+
             Lord lord = threatPawn.GetLord();
 
             // === 1. EXCLUDE TACTICALLY RETREATING PAWNS ===
@@ -315,13 +322,13 @@ public static class PawnService
 
         Map map = pawn.Map;
         Faction mapFaction = map.ParentFaction;
-        
-        if (mapFaction == pawn.Faction || map.IsPlayerHome)
+
+        if (mapFaction == pawn.Faction || (map.IsPlayerHome && pawn.Faction == Faction.OfPlayer))
             return MapRole.Defending; // player colonist
-        
+
         if (pawn.Faction.HostileTo(mapFaction))
             return MapRole.Invading;
-            
+
         return MapRole.Visiting; // friendly trader or visitor
     }
 
@@ -354,6 +361,16 @@ public static class PawnService
         }
 
         return result.TrimEnd();
+    }
+
+    public static bool IsPlayer(this Pawn pawn)
+    {
+        return pawn == Cache.GetPlayer();
+    }
+
+    public static bool HasVocalLink(this Pawn pawn)
+    {
+        return Settings.Get().AllowNonHumanToTalk && pawn.health.hediffSet.HasHediff(Constant.VocalLinkDef);
     }
 
     private static string DescribeResistance(float value)

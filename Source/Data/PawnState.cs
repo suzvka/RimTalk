@@ -74,26 +74,30 @@ public class PawnState(Pawn pawn)
 
     public bool CanDisplayTalk()
     {
+        if (Pawn.IsPlayer()) return true;
+        
         if (WorldRendererUtility.CurrentWorldRenderMode == WorldRenderMode.Planet || Find.CurrentMap == null ||
             Pawn.Map != Find.CurrentMap || !Pawn.Spawned)
         {
             return false;
         }
+        
+        RimTalkSettings settings = Settings.Get();
 
-        if (!Settings.Get().DisplayTalkWhenDrafted && Pawn.Drafted)
+        if (!settings.DisplayTalkWhenDrafted && Pawn.Drafted)
             return false;
 
-        return Pawn.Awake()
-               && !Pawn.Dead
-               && Pawn.CurJobDef != JobDefOf.LayDown
-               && Pawn.CurJobDef != JobDefOf.LayDownAwake
-               && Pawn.CurJobDef != JobDefOf.LayDownResting
-               && TalkInitiationWeight > 0;
+        if (!settings.ContinueDialogueWhileSleeping && !Pawn.Awake())
+            return false;
+
+        return !Pawn.Dead && TalkInitiationWeight > 0;
     }
 
     public bool CanGenerateTalk()
     {
-        return !IsGeneratingTalk && CanDisplayTalk() && TalkResponses.Empty() 
+        if (Pawn.IsPlayer()) return true;
+        
+        return !IsGeneratingTalk && CanDisplayTalk() && Pawn.Awake() && TalkResponses.Empty() 
                && CommonUtil.HasPassed(LastTalkTick, Settings.Get().TalkInterval);;
     }
     
