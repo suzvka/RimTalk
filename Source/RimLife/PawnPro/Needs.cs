@@ -1,16 +1,77 @@
-﻿using System;
+﻿using RimWorld;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using Verse;
 
 namespace RimLife
 {
+    /// <summary>
+    /// Represents a snapshot of a Pawn's needs.
+    /// Note: This data is a snapshot and its temporal consistency is not guaranteed.
+    /// </summary>
     public class NeedsInfo
     {
         // 所有的需求都放入这个列表，不再区分 Food/Rest
-        public List<NeedEntry> AllNeeds = new List<NeedEntry>();
+        public IReadOnlyList<NeedEntry> AllNeeds { get; }
+
+        private NeedsInfo()
+        {
+            AllNeeds = new List<NeedEntry>();
+        }
+
+        private NeedsInfo(IReadOnlyList<NeedEntry> allNeeds)
+        {
+            AllNeeds = allNeeds;
+        }
+
+        public static NeedsInfo CreateFrom(Pawn p)
+        {
+            if (p?.needs == null) return new NeedsInfo();
+
+            var allNeedsList = new List<NeedEntry>();
+            var allNeeds = p.needs.AllNeeds;
+            if (allNeeds != null)
+            {
+                foreach (var need in allNeeds)
+                {
+                    if (need == null) continue;
+                    try
+                    {
+                        float thresholdLow = 0.3f; // 简单阈值占位
+                        float cur = need.CurLevelPercentage;
+                        bool critical = cur < (thresholdLow * 0.5f) || cur < 0.15f;
+
+                        var entry = new NeedEntry
+                        {
+                            DefName = need.def?.defName ?? need.LabelCap,
+                            Label = need.LabelCap,
+                            CurLevel = cur,
+                            ThresholdLow = thresholdLow,
+                            IsCritical = critical
+                        };
+                        allNeedsList.Add(entry);
+                    }
+                    catch
+                    {
+                        // 忽略单个需求的异常
+                    }
+                }
+            }
+            return new NeedsInfo(allNeedsList);
+        }
+
+        public static Task<NeedsInfo> CreateFromAsync(Pawn p)
+        {
+            if (p == null) return Task.FromResult(new NeedsInfo());
+
+            return MainThreadDispatcher.EnqueueAsync(() => CreateFrom(p));
+        }
     }
+
+
 
     public struct NeedEntry
     {
