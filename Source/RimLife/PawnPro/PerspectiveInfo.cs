@@ -5,132 +5,152 @@ using RimWorld;
 
 namespace RimLife
 {
-	// Represents what a Pawn can currently perceive in its environment.
-	public readonly struct PerspectiveInfo
-	{
-		// --- Constants ---
-		private const float RecognizableRange = 13f; // Distance for detailed recognition
-		private const float VisualRange = 26f;       // General line-of-sight distance
+    public class PerspectiveInfo
+    {
+        // 统一环境信息
+        public EnvironmentPro Environment { get; set; }
 
-		// --- Public Readonly Fields ---
-		public readonly List<Building> ContainedBuildings;
-		public readonly List<string> VisiblePawnIDs;
-		public readonly List<string> RoommateIDs;
-		public readonly List<string> RecognizablePawnIDs;
+        // 可见事物快照列表 (不包含 Pawn)
+        public List<ThingSnapshot> VisibleThings { get; set; } = new List<ThingSnapshot>();
 
-		// --- Private Readonly Fields ---
-		private readonly Pawn _myselfPawn;
+        // 统一的可见 Pawn 快照列表：所有在视野与视线(LineOfSight)内的 Pawn（不再拆分）
+        public List<PawnRelationSnapshot> VisiblePawnSnapshots { get; set; } = new List<PawnRelationSnapshot>();
 
-		// --- Constructor ---
-		public PerspectiveInfo(Pawn pawn)
-		{
-            _myselfPawn = pawn;
-			var map = pawn.Map;
+        // 接口：获取“可见但不可识别的物种及数量” (距离 > RecognizableRange)
+        public IEnumerable<string> GetUnrecognizableSpeciesCounts()
+        {
+            return VisiblePawnSnapshots
+                .Where(p => p.Distance > PerspectiveExtractor.RecognizableRange)
+                .GroupBy(p => p.DefName)
+                .OrderBy(g => g.Key)
+                .Select(g => $"{g.Key}:{g.Count()}");
+        }
 
-			if (map == null)
-			{
-				ContainedBuildings = new List<Building>();
-				VisiblePawnIDs = new List<string>();
-				RoommateIDs = new List<string>();
-				RecognizablePawnIDs = new List<string>();
-				return;
-			}
+        // 接口：获取“可识别的 Pawn ID” (距离 ≤ RecognizableRange)
+        public IEnumerable<string> GetRecognizablePawnIDs()
+        {
+            return VisiblePawnSnapshots
+                .Where(p => p.Distance <= PerspectiveExtractor.RecognizableRange)
+                .Select(p => p.ID);
+        }
+    }
 
-			var room = pawn.GetRoom();
+    // 物体快照 (建筑、物品、污秽等)；不包含任何生物。生物统一在 VisiblePawnSnapshots 中表示。
+    public struct ThingSnapshot
+    {
+        public string DefName;
+        public string Label;      // e.g. "Grand sculpture"
+        public string Category;   // e.g. "Building", "Item", "Filth", "Food"
+        public float Distance;    // 离观察者的距离
+        public string Quality;    // e.g. "Legendary" (如果有)
+    }
 
-			// Determine buildings in view
-			if (room != null && !room.PsychologicallyOutdoors)
-			{
-				ContainedBuildings = [.. room.ContainedThings<Building>()];
+    // Pawn 基础快照：仅保存物种与基础身份信息（不含社交关系/敌对状态等动态高层语义）。
+    public struct PawnRelationSnapshot
+    {
+        public string ID;         // ThingID
+        public string Name;       // 显示名（可能用于 UI 或上层进一步索引）
+        public string DefName;    // 种族定义名
+        public float Distance;    // 与观察者距离
+    }
+
+    public static class PerspectiveExtractor
+    {
+        // --- Constants (对外公开，供 PerspectiveInfo 的接口方法使用) ---
+        public const float RecognizableRange = 13f; // 识别详细个体信息的有效距离阈值
+        public const float VisualRange = 26f;       // 最大视野范围 (用于初步捕获)
+
+        public static PerspectiveInfo Capture(Pawn pawn)
+        {
+            var snapshot = new PerspectiveInfo();
+
+            // 1. 基础校验
+            if (pawn == null || !pawn.Spawned || pawn.Map == null)
+                return snapshot;
+
+            Map map = pawn.Map;
+
+            // 2. 环境分析 (统一使用 EnvironmentPro)
+            snapshot.Environment = new EnvironmentPro(pawn);
+
+            // 3. 提取可见物体
+            IEnumerable<Thing> candidateThings;
+            if (snapshot.Environment.Type == EnvironmentType.Indoors)
+            {
+                // 室内环境，直接从房间获取物体列表
+                // 注意：EnvironmentPro 内部已经处理了 room 的 null 判断
+                Room room = pawn.GetRoom(); // 需要原始 Room 对象来获取物体
+                if (room != null)
+                {
+                    candidateThings = room.ContainedAndAdjacentThings;
+                }
+                else
+                {
+                    // 理论上 Type 是 Indoors 时 room 不会为 null，作为安全保障
+                    candidateThings = Enumerable.Empty<Thing>();
+                }
             }
-			else
-			{
-				ContainedBuildings = map.listerThings.AllThings
-					.OfType<Building>()
-					.Where(b => b.Position.InHorDistOf(pawn.Position, VisualRange))
-					.ToList();
-			}
+            else
+            {
+                // 室外环境，扫描 pawn 周围
+                candidateThings = GenRadial.RadialDistinctThingsAround(pawn.Position, map, VisualRange, true);
+            }
 
-			// Find all pawns on the map
-			var allPawns = map.mapPawns.AllPawnsSpawned.Where(p => p != pawn).ToList();
+            foreach (var t in candidateThings)
+            {
+                if (t == pawn || t is Pawn || t.def.mote != null) continue;
 
-			VisiblePawnIDs = allPawns
-				.Where(p => GenSight.LineOfSight(pawn.Position, p.Position, map, true))
-				.Select(p => p.ThingID)
-				.ToList();
+                // 检查视线
+                bool canSee = GenSight.LineOfSight(pawn.Position, t.Position, map, skipFirstCell: true);
+                if (!canSee) continue;
 
-			RoommateIDs = room?.ContainedAndAdjacentThings
-				.OfType<Pawn>()
-				.Where(p => p != pawn)
-				.Select(p => p.ThingID)
-				.ToList() ?? new List<string>();
+                var ts = new ThingSnapshot
+                {
+                    DefName = t.def.defName,
+                    Label = t.Label,
+                    Category = GetCategoryLabel(t),
+                    Distance = t.Position.DistanceTo(pawn.Position)
+                };
 
-			RecognizablePawnIDs = allPawns
-				.Where(p => p.Position.InHorDistOf(pawn.Position, RecognizableRange))
-				.Select(p => p.ThingID)
-				.ToList();
-		}
+                if (t.TryGetQuality(out QualityCategory qc))
+                    ts.Quality = qc.ToString();
 
-		// --- Public Methods ---
+                snapshot.VisibleThings.Add(ts);
+            }
 
-		public string ToStringFull()
-		{
-            var localMyselfPawnPro = new PawnPro(_myselfPawn);
-			var jw = new Tool.JsonWriter(256);
+            // 4. 捕获所有视野内可见 Pawn（统一放入 VisiblePawnSnapshots）
+            var allPawns = map.mapPawns.AllPawnsSpawned;
+            foreach (var target in allPawns)
+            {
+                if (target == pawn) continue;
 
-			// Buildings: Grouped by name and count
-			var buildingCounts = GroupAndCount(ContainedBuildings, b => b.LabelCap);
-			if (buildingCounts.Any())
-			{
-				jw.Array("Buildings", buildingCounts.Select(kv => $"{kv.Key} x{kv.Value}"));
-			}
+                float dist = target.Position.DistanceTo(pawn.Position);
+                if (dist > VisualRange) continue;
+                if (!GenSight.LineOfSight(pawn.Position, target.Position, map, skipFirstCell: true)) continue;
 
-			// Visible Pawns (not recognizable): Grouped by species
-			var nonRecognizablePawns = VisiblePawnIDs.Except(RecognizablePawnIDs ?? Enumerable.Empty<string>())
-				.Select(p => Tool.GetPawn(p))
-				.Where(p => p != null);
+                snapshot.VisiblePawnSnapshots.Add(CreatePawnSnapshot(target, dist));
+            }
 
-			var speciesCounts = GroupAndCount(nonRecognizablePawns, p => GetApproxSpeciesName(p));
-			if (speciesCounts.Any())
-			{
-				jw.Array("VisiblePawns", speciesCounts.Select(kv => $"{kv.Key} x{kv.Value}"));
-			}
+            return snapshot;
+        }
 
-			// Recognizable Pawns: Detailed info
-			var recognizablePawnDetails = RecognizablePawnIDs
-				.Select(id =>
-				{
-					Pawn p = Tool.GetPawn(id);
-					if (p == null) return null;
+        private static PawnRelationSnapshot CreatePawnSnapshot(Pawn target, float dist)
+        {
+            return new PawnRelationSnapshot
+            {
+                ID = target.ThingID,
+                Name = target.Name.ToStringShort,
+                DefName = target.def.defName,
+                Distance = dist
+            };
+        }
 
-					var p_pro = new PawnPro(p);
-					var jw2 = new Tool.JsonWriter(128)
-						.PropRaw("PawnInfo", p_pro.ToStringCore())
-						.Prop("MyOpinion", localMyselfPawnPro.GetPawnRelation(p));
-					return jw2.Close();
-				})
-				.Where(s => !string.IsNullOrEmpty(s))
-				.ToList();
-
-			if (recognizablePawnDetails.Any())
-			{
-				jw.ArrayRaw("RecognizablePawns", recognizablePawnDetails);
-			}
-
-			return jw.Close();
-		}
-
-		// --- Private Helper Methods ---
-
-		private Dictionary<string, int> GroupAndCount<T>(IEnumerable<T> items, System.Func<T, string> keySelector)
-		{
-			if (items == null || !items.Any()) return new Dictionary<string, int>();
-			return items.GroupBy(keySelector).ToDictionary(g => g.Key, g => g.Count());
-		}
-
-		private static string GetApproxSpeciesName(Pawn p)
-		{
-			return p?.def?.label ?? "Unknown";
-		}
-	}
+        private static string GetCategoryLabel(Thing t)
+        {
+            if (t is Building) return "Building";
+            if (t.def.IsFilth) return "Filth";
+            if (t.def.IsIngestible) return "Food";
+            return "Item";
+        }
+    }
 }

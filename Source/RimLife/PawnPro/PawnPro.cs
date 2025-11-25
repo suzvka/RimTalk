@@ -1,391 +1,294 @@
 ﻿using RimWorld;
+using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using Verse;
+using UnityEngine; // for Mathf
 
 namespace RimLife
 {
-	// Pawn 类型
-	public enum PawnType
-	{
-		Character, //角色
-		Animal, // 动物
-		Mechanoid, //机械
-		Insect, // 虫族
-		Other //其它
-	}
+    // Pawn 类型
+    public enum PawnType
+    {
+        Character, //角色
+        Animal, // 动物
+        Mechanoid, //机械
+        Insect, // 虫族
+        Other //其它
+    }
 
-	// Pawn关系
-	public enum PawnRelation
-	{
-		OurParty, // 自己
-		Ally, //盟友
-		Neutral, // 中立
-		Enemy, // 敌人
-		Other //其他
-	}
+    // Pawn关系
+    public enum PawnRelation
+    {
+        OurParty, // 自己
+        Ally, //盟友
+        Neutral, // 中立
+        Enemy, // 敌人
+        Other //其他
+    }
 
-	public class PawnPro
-	{
-		// --- Constructor ---
-		public PawnPro(Pawn pawn)
-		{
-			Myself = pawn;
-			_speciesInfo = new SpeciesInfo(pawn);
-			_healthInfo = new HealthInfo(pawn);
-			_perspective = new PerspectiveInfo(pawn);
-			_trait = new TraitsInfo(pawn);
-			_mood = new MoodInfo(pawn);
-			_activity = new ActivityInfo(pawn);
-		}
+    /// <summary>
+    /// 创建开销极低。只有访问具体属性（如 .Perspective）时，才会触发昂贵的计算。
+    /// 注意：必须在主线程创建和访问！
+    /// </summary>
+    public class PawnPro
+    {
+        // 原始 Pawn 引用，用于按需提取数据
+        private readonly Pawn _sourcePawn;
 
-		// --- Public Properties ---
+        // ---1. 基础元数据---
+        public string ID { get; }
+        public string Name { get; }
+        public string DefName { get; }
+        public string FactionLabel { get; }
+        public float AgeBio { get; }
+        public string Gender { get; }
+        public PawnType PawnType { get; }
 
-		// Basic Info (dynamic)
-		public string PawnID => Myself.ThingID;
-		public string Epithet => Myself?.Name?.ToStringShort ?? Myself?.LabelShort ?? "Unknown";
-		public string FullName => Myself?.Name?.ToStringFull ?? Myself?.LabelCap ?? "Unknown";
-		public int Age => Myself?.ageTracker?.AgeBiologicalYears ?? 0;
-		public string LifeStage => GetLifeStageAtAge(Myself, Age)?.def?.label;
+        public bool IsDead => _sourcePawn.Dead;
+        public bool IsDowned => _sourcePawn.Downed;
+        public bool IsAwake => !_sourcePawn.jobs.curDriver.asleep;
 
-		// Activity Info
-		public string Action => _activity?.ToStringFull() ?? "{}";
-		public System.Collections.Generic.IEnumerable<string> ActionQueue => _activity?.ActionQueue ?? Enumerable.Empty<string>();
+        // --- 构造函数 ---
+        public PawnPro(Pawn pawn)
+        {
+            if (pawn == null) throw new ArgumentNullException(nameof(pawn));
+            _sourcePawn = pawn;
 
-		// Core Objects
-		public Pawn Pawn => Myself;
-		public Faction Faction => Myself?.Faction;
+            //立即初始化轻量数据
+            ID = pawn.ThingID;
+            Name = pawn.Name.ToStringShort;
+            DefName = pawn.def.defName;
+            FactionLabel = pawn.Faction?.Name ?? "Unknown";
+            AgeBio = pawn.ageTracker.AgeBiologicalYearsFloat;
+            Gender = pawn.gender.ToString();
+            PawnType = GetPawnType(pawn);
+        }
 
-		// --- Public Methods ---
+        // ---2. 懒加载子模块 (Lazy Modules) ---
 
-		// Get relation with another Pawn
-		public string GetPawnRelation(Pawn otherPawn)
-		{
-			if (Myself?.relations == null || otherPawn == null || otherPawn == Myself)
-			{
-				return "";
-			}
+        private HealthInfo _health;
+        public HealthInfo Health => _health ??= DataExtractor.ExtractHealth(_sourcePawn);
 
-			string label = null;
-			float opinionValue = 0f;
+        private NeedsInfo _needs;
+        public NeedsInfo Needs => _needs ??= DataExtractor.ExtractNeeds(_sourcePawn);
 
-			try
-			{
-				opinionValue = Myself.relations.OpinionOf(otherPawn);
+        private MoodInfo _psychology;
+        public MoodInfo Psychology => _psychology ?? (PawnType == PawnType.Character ? DataExtractor.ExtractMood(_sourcePawn) : null);
 
-				// Step 1: Check for the most important direct or family relationship
-				PawnRelationDef mostImportantRelation = Myself.GetMostImportantRelation(otherPawn);
-				if (mostImportantRelation != null)
-				{
-					label = mostImportantRelation.GetGenderSpecificLabelCap(otherPawn);
-				}
+        private ActivityInfo _activity;
+        public ActivityInfo Activity => _activity ??= DataExtractor.ExtractActivity(_sourcePawn);
 
-				// Step 2: If no family relation, check for an overriding status
-				if (string.IsNullOrEmpty(label))
-				{
-					if ((Myself.IsPrisoner || Myself.IsSlave) && otherPawn.IsFreeNonSlaveColonist)
-					{
-						label = "Master".Translate();
-					}
-					else if (otherPawn.IsPrisoner)
-					{
-						label = "Prisoner".Translate();
-					}
-					else if (otherPawn.IsSlave)
-					{
-						label = "Slave".Translate();
-					}
-					else if (Myself.Faction != null && otherPawn.Faction != null && Myself.Faction.HostileTo(otherPawn.Faction))
-					{
-						label = "Enemy".Translate();
-					}
-				}
+        private PerspectiveInfo _perspective;
+        public PerspectiveInfo Perspective => _perspective ??= PerspectiveExtractor.Capture(_sourcePawn);
 
-				// Step 3: If no other label found, fall back to opinion-based relationship
-				if (string.IsNullOrEmpty(label) && !IsVisitor(otherPawn) && !IsEnemy(otherPawn))
-				{
-					const float FriendOpinionThreshold = 20f;
-					const float RivalOpinionThreshold = -20f;
+        // --- 辅助方法 ---
+        private static PawnType GetPawnType(Pawn p)
+        {
+            if (p.RaceProps.Humanlike) return PawnType.Character;
+            if (p.RaceProps.Animal) return PawnType.Animal;
+            if (p.RaceProps.IsMechanoid) return PawnType.Mechanoid;
+            if (p.RaceProps.Insect) return PawnType.Insect;
+            return PawnType.Other;
+        }
 
-					if (opinionValue >= FriendOpinionThreshold)
-					{
-						label = "Friend".Translate();
-					}
-					else if (opinionValue <= RivalOpinionThreshold)
-					{
-						label = "Rival".Translate();
-					}
-					else
-					{
-						label = "Acquaintance".Translate();
-					}
-				}
+        public static class DataExtractor
+        {
+            //关键能力选择，避免字典过大
+            private static readonly PawnCapacityDef[] KeyCapacityDefs =
+            [
+                PawnCapacityDefOf.Moving,
+                PawnCapacityDefOf.Manipulation,
+                PawnCapacityDefOf.Talking,
+                PawnCapacityDefOf.Consciousness,
+                PawnCapacityDefOf.Sight,
+                PawnCapacityDefOf.Hearing,
+                PawnCapacityDefOf.Breathing
+            ];
 
-				if (!string.IsNullOrEmpty(label))
-				{
-					string opinion = opinionValue.ToStringWithSign();
-					return $"{label}(Opinion:{opinion})";
-				}
-			}
-			catch (System.Exception)
-			{
-				// Skip if opinion calculation fails
-			}
+            public static HealthInfo ExtractHealth(Pawn p)
+            {
+                var info = new HealthInfo();
+                if (p?.health == null) return info;
 
-			return "";
-		}
+                // 汇总疼痛与出血
+                info.SummaryPain = p.health.hediffSet.PainTotal;
+                info.SummaryBleedRate = p.health.hediffSet.BleedRateTotal;
 
-		// Get relation with a faction
-		public string GetFactionRelation(Faction otherFaction = null)
-		{
-			// Default to player faction if null
-			otherFaction ??= Faction.OfPlayer;
-			return ComputeRelation(otherFaction).ToString();
-		}
+                // 能力值 (0-1 范围，RimWorld 中有可能超过1，做截断)
+                foreach (var def in KeyCapacityDefs)
+                {
+                    try
+                    {
+                        float level = p.health.capacities.GetLevel(def);
+                        info.Capacities[def.defName] = Mathf.Clamp01(level);
+                    }
+                    catch
+                    {
+                        // 忽略异常（少数能力在当前种族可能不存在）
+                    }
+                }
 
-		public bool IsVisitor(Pawn pawn)
-		{
-			return pawn?.Faction != null && pawn.Faction != Myself.Faction && !pawn.HostileTo(Myself.Faction);
-		}
+                //伤病列表
+                foreach (var h in p.health.hediffSet.hediffs)
+                {
+                    if (h == null || !h.Visible) continue;
+                    var entry = new HealthEntry
+                    {
+                        Label = h.def.label ?? h.LabelCap,
+                        Part = h.Part?.Label ?? "Whole body",
+                        Severity = h.Severity,
+                        IsBleeding = h.Bleeding,
+                        IsPermanent = h.IsPermanent(),
+                        IsInfection = h.def.isInfection,
+                        GroupTag = GetHealthGroupTag(h)
+                    };
+                    info.Injuries.Add(entry);
+                }
 
-		public bool IsEnemy(Pawn pawn)
-		{
-			return pawn != null && pawn.HostileTo(Myself.Faction);
-		}
+                return info;
+            }
 
-		// --- Serialization Methods ---
+            private static string GetHealthGroupTag(Hediff h)
+            {
+                if (h.def.isInfection) return "Disease";
+                if (h.Bleeding) return "Trauma";
+                if (h.IsPermanent()) return "Permanent";
+                if (h.def.makesSickThought) return "Ill";
+                return "Other";
+            }
 
-		public string ToStringCore()
-		{
-			return $"{BuildBaseInfo()},{_activity.ToStringLite()}";
-		}
+            public static NeedsInfo ExtractNeeds(Pawn p)
+            {
+                var info = new NeedsInfo();
+                if (p?.needs == null) return info;
 
-		public string ToStringLite()
-		{
-			var jw = new Tool.JsonWriter(256)
-				.Prop("ID", PawnID)
-				.Prop("PawnInfo", BuildBaseInfo())
-				.PropRaw("Childhood", Myself.story.Childhood?.title ?? string.Empty)
-				.PropRaw("Adulthood", Myself.story.Adulthood?.title ?? string.Empty)
-				.PropRaw("Traits", _trait.ToStringLite())
-				.PropRaw("Action", _activity.ToStringLite())
-				.PropRaw("Mood", _mood.ToStringLite())
-				.PropRaw("Equipment", BuildEquipmentLite())
-				.Prop("HealthStatus", _healthInfo.OverallStatus.ToString());
-			return jw.Close();
-		}
+                foreach (var need in p.needs.AllNeeds)
+                {
+                    if (need == null) continue;
+                    try
+                    {
+                        float thresholdLow =0.3f; // 简单阈值占位
+                        float cur = need.CurLevelPercentage;
+                        bool critical = cur < (thresholdLow *0.5f) || cur <0.15f;
 
-		public string ToStringFull()
-		{
-			var childhoodExperiences = new Tool.JsonWriter(128)
-				.Prop("Title", Myself.story.Childhood?.title ?? string.Empty)
-				.Prop("Description", Myself.story.Childhood?.description ?? string.Empty);
+                        var entry = new NeedEntry
+                        {
+                            DefName = need.def?.defName ?? need.LabelCap,
+                            Label = need.LabelCap,
+                            CurLevel = cur,
+                            ThresholdLow = thresholdLow,
+                            IsCritical = critical
+                        };
+                        info.AllNeeds.Add(entry);
+                    }
+                    catch
+                    {
+                        // 忽略单个需求的异常
+                    }
+                }
+                return info;
+            }
 
-			var adulthoodExperiences = new Tool.JsonWriter(512)
-				.Prop("Title", Myself.story.Adulthood?.title ?? string.Empty)
-				.Prop("Description", Myself.story.Adulthood?.description ?? string.Empty);
+            public static MoodInfo ExtractMood(Pawn p)
+            {
+                var info = new MoodInfo();
+                if (p == null || !p.RaceProps.Humanlike) return info;
 
-			var jw = new Tool.JsonWriter(1024)
-				.Prop("ID", PawnID)
-				.Prop("PawnInfo", BuildBaseInfo())
-				.Prop("FullName", FullName)
-				.PropRaw("Childhood", childhoodExperiences.Close())
-				.PropRaw("Adulthood", adulthoodExperiences.Close())
-				.PropRaw("Traits", _trait.ToStringFull())
-				.Prop("Stage", LifeStage ?? string.Empty)
-				.PropRaw("Mood", _mood.ToStringFull())
-				.PropRaw("Species", _speciesInfo.ToStringFull())
-				.PropRaw("Action", _activity.ToStringFull())
-				.Prop("ActionQueueCount", ActionQueue.Any() ? $"+{ActionQueue.Count()}" : string.Empty)
-				.PropRaw("Equipment", BuildEquipmentFull())
-				.PropRaw("Health", _healthInfo.ToStringFull())
-				.PropRaw("Perspective", _perspective.ToStringFull());
+                // 心情与精神状态
+                info.MoodLevel = p.needs?.mood?.CurLevelPercentage ??0f;
+                if (p.InMentalState)
+                {
+                    info.MentalStateLabel = p.MentalState?.def?.label ?? p.MentalState?.InspectLine;
+                }
 
-			return jw.Close();
-		}
+                // 特质
+                if (p.story?.traits?.allTraits != null)
+                {
+                    foreach (var trait in p.story.traits.allTraits)
+                    {
+                        if (trait == null) continue;
+                        info.Traits.Add(new TraitEntry
+                        {
+                            DefName = trait.def.defName,
+                            Label = trait.LabelCap,
+                            Degree = trait.Degree
+                        });
+                    }
+                }
 
-		// --- Private Fields ---
+                // 活跃想法（包括记忆 + 情境）
+                var allThoughts = new List<Thought>();
+                try { p.needs?.mood?.thoughts?.GetAllMoodThoughts(allThoughts); } catch { }
+                foreach (var t in allThoughts)
+                {
+                    if (t == null) continue;
+                    float offset =0f;
+                    try { offset = t.MoodOffset(); } catch { }
 
-		private readonly Pawn Myself;
-		private readonly SpeciesInfo _speciesInfo;
-		private readonly HealthInfo _healthInfo;
-		private readonly PerspectiveInfo _perspective;
-		private readonly TraitsInfo _trait;
-		private readonly MoodInfo _mood;
-		private readonly ActivityInfo _activity;
+                    float durationRatio =1f;
+                    if (t is Thought_Memory mem)
+                    {
+                        //估算剩余时间比例（安全处理）
+                        int duration = mem.def.DurationTicks;
+                        if (duration >0)
+                        {
+                            durationRatio =1f - (mem.age / (float)duration);
+                            durationRatio = Mathf.Clamp01(durationRatio);
+                        }
+                    }
 
-		// --- Private Methods ---
+                    info.ActiveThoughts.Add(new ThoughtEntry
+                    {
+                        Label = t.LabelCap,
+                        MoodOffset = offset,
+                        DurationRatio = durationRatio
+                    });
+                }
 
-		private PawnRelation ComputeRelation(Faction otherFaction)
-		{
-			if (Myself == null) return PawnRelation.Other;
+                return info;
+            }
 
-			// No faction (e.g., wild animals)
-			if (Myself.Faction == null)
-			{
-				return PawnRelation.Neutral;
-			}
+            public static ActivityInfo ExtractActivity(Pawn p)
+            {
+                var info = new ActivityInfo();
+                if (p == null || p.jobs == null) return info;
 
-			// Own faction
-			if (Myself.Faction == otherFaction)
-			{
-				return PawnRelation.OurParty;
-			}
+                // 姿态
+                try { info.Posture = p.GetPosture().ToString(); } catch { }
 
-			// Relation with other factions
-			var relation = Myself.Faction.RelationWith(otherFaction);
-			if (relation == null)
-			{
-				return PawnRelation.Neutral; // Default to neutral
-			}
+                // 遍历工作队列
+                foreach (var job in p.jobs.jobQueue)
+                {
+                    if (job?.job == null) continue;
+                    try
+                    {
+                        info.Activities.Add(new ActivityEntry
+                        {
+                            JobDefName = job.job.def.defName,
+                            JobReport = job.job.GetReport(p)
+                        });
+                    }
+                    catch { }
+                }
 
-			switch (relation.kind)
-			{
-				case FactionRelationKind.Hostile: return PawnRelation.Enemy;
-				case FactionRelationKind.Ally: return PawnRelation.Ally;
-				case FactionRelationKind.Neutral: return PawnRelation.Neutral;
-				default: return PawnRelation.Other;
-			}
-		}
+                // 添加当前工作
+                if (p.CurJob != null)
+                {
+                    try
+                    {
+                        info.Activities.Insert(0, new ActivityEntry
+                        {
+                            JobDefName = p.CurJob.def.defName,
+                            JobReport = p.CurJob.GetReport(p)
+                        });
+                    }
+                    catch { }
+                }
 
-		private string BuildBaseInfo()
-		{
-			var sb = new StringBuilder(128);
-			sb.Append(Epithet)
-				.Append(" (")
-				.Append(Age)
-				.Append("yo, ")
-				.Append(GetFactionDisplayName())
-				.Append("'s ")
-				.Append(_speciesInfo.SpeciesName)
-				.Append(" ")
-				.Append(GetGenderText())
-				.Append(", ")
-				.Append(GetFactionRelation())
-				.Append(")");
-			return sb.ToString();
-		}
-
-		private string GetFactionDisplayName()
-		{
-			if (Myself?.Faction == null) return "None";
-			string name = Myself.Faction.Name;
-			if (string.IsNullOrEmpty(name)) name = Myself.Faction.def?.label ?? Myself.Faction.ToString();
-			return name;
-		}
-
-		private string GetGenderText()
-		{
-			return Myself.gender.ToString();
-		}
-
-		// --- Equipment Helpers ---
-
-		private string BuildEquipmentLite()
-		{
-			string weapon = Myself?.equipment?.Primary?.LabelCap ?? string.Empty;
-			var inventory = Myself?.inventory?.innerContainer?
-				.Where(t => t != null && t.stackCount > 0)
-				.GroupBy(t => t.LabelCap)
-				.Select(g => $"{g.Key} x{g.Sum(t => t.stackCount)}") ?? Enumerable.Empty<string>();
-
-			var jw = new Tool.JsonWriter(256)
-				.Prop("Weapon", weapon)
-				.PropRaw("Inventory", BuildJsonArray(inventory));
-
-			// Armor values (CE compatible)
-			float blunt = Myself?.GetStatValue(StatDefOf.ArmorRating_Blunt) ?? 0f;
-			float sharp = Myself?.GetStatValue(StatDefOf.ArmorRating_Sharp) ?? 0f;
-
-			if (IsCeActive)
-			{
-				jw.Prop("ArmorBlunt_mmRHA", blunt.ToString("F2"));
-				jw.Prop("ArmorSharp_mmRHA", sharp.ToString("F2"));
-			}
-			else
-			{
-				jw.Prop("ArmorBlunt", (int)System.Math.Round(blunt * 100)); // convert to percent
-				jw.Prop("ArmorSharp", (int)System.Math.Round(sharp * 100));
-			}
-
-			return jw.Close();
-		}
-
-		private string BuildEquipmentFull()
-		{
-			string weapon = Myself?.equipment?.Primary?.LabelCap ?? string.Empty;
-			var inventory = Myself?.inventory?.innerContainer?
-				.Where(t => t != null && t.stackCount > 0)
-				.GroupBy(t => t.LabelCap)
-				.Select(g => $"{g.Key} x{g.Sum(t => t.stackCount)}") ?? Enumerable.Empty<string>();
-			var apparel = Myself?.apparel?.WornApparel?
-				.Where(a => a != null)
-				.Select(a => a.LabelCap) ?? Enumerable.Empty<string>();
-
-			var jw = new Tool.JsonWriter(384)
-				.Prop("Weapon", weapon)
-				.PropRaw("Inventory", BuildJsonArray(inventory))
-				.PropRaw("Apparel", BuildJsonArray(apparel));
-
-			// Armor values (CE compatible)
-			float blunt = Myself?.GetStatValue(StatDefOf.ArmorRating_Blunt) ?? 0f;
-			float sharp = Myself?.GetStatValue(StatDefOf.ArmorRating_Sharp) ?? 0f;
-
-			if (IsCeActive)
-			{
-				jw.Prop("ArmorBlunt_mmRHA", blunt.ToString("F2"));
-				jw.Prop("ArmorSharp_mmRHA", sharp.ToString("F2"));
-			}
-			else
-			{
-				jw.Prop("ArmorBlunt", (int)System.Math.Round(blunt * 100));
-				jw.Prop("ArmorSharp", (int)System.Math.Round(sharp * 100));
-			}
-
-			return jw.Close();
-		}
-
-		// --- Static Helpers ---
-
-		private static LifeStageAge GetLifeStageAtAge(Pawn pawn, float age)
-		{
-			if (pawn?.RaceProps?.lifeStageAges == null) return null;
-			return pawn.RaceProps.lifeStageAges.FindLast(stage => stage.minAge <= age);
-		}
-
-		private static string BuildJsonArray(System.Collections.Generic.IEnumerable<string> values)
-		{
-			var sb = new StringBuilder(128);
-			sb.Append("[");
-			bool first = true;
-			foreach (var v in values)
-			{
-				if (!first) sb.Append(",");
-				sb.Append("\"").Append(EscapeJson(v)).Append("\"");
-				first = false;
-			}
-			sb.Append("]");
-			return sb.ToString();
-		}
-
-		private static string EscapeJson(string s)
-		{
-			if (string.IsNullOrEmpty(s)) return string.Empty;
-			return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
-		}
-
-		// --- CE Compatibility ---
-		private static bool? _isCeActive;
-		private static bool IsCeActive
-		{
-			get
-			{
-				if (_isCeActive == null)
-				{
-					_isCeActive = ModsConfig.IsActive("ceteam.combatextended");
-				}
-				return _isCeActive.Value;
-			}
-		}
-	}
+                return info;
+            }
+        }
+    }
 }
